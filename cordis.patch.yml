@@ -1,0 +1,7 @@
+# Bundle patch for dsh-compact-tool: inserts its plugin row into the profile
+# roster so the host can resolve `compact-tool` to this package. Installed as
+# a profile bundle layer (the `dsh.bundle.patch` manifest field); see
+# `dsh plugin --profile desktop add link:<repo path>`.
+- insert:
+    - id: compact-tool
+      name: 'dsh-compact-tool'

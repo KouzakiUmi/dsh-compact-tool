@@ -1,0 +1,10 @@
+/node_modules/
+/lib/
+*.tsbuildinfo
+
+# Local DSH source extracts and working notes
+/_ref/
+/.audit-tmp/
+/AGENTS.md
+/AUDIT.md
+/COMPACT-UX.md

@@ -18,6 +18,23 @@ export interface DialogRequest {
 
 export const dialogStore = createStore<DialogRequest | null>(null)
 
+/**
+ * Config revision bumped after a SUCCESSFUL write from the settings page or
+ * the full policy dialog. The dock keeps an optimistic per-route copy seeded
+ * once per route, so without this signal an edit made elsewhere never reached
+ * the footer ring until a model switch or page refresh. The dock's own writes
+ * do not bump it (re-seeding itself would race its in-flight edits).
+ */
+export const configRevision = createStore<number>(0)
+
+export function bumpConfigRevision(): void {
+  configRevision.set(configRevision.getSnapshot() + 1)
+}
+
+export function useConfigRevision(): number {
+  return useSyncExternalStore(configRevision.subscribe, configRevision.getSnapshot)
+}
+
 /** Open the per-model policy dialog for one session route. */
 export function openDialog(request: DialogRequest): void {
   dialogStore.set(request)

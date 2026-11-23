@@ -158,7 +158,12 @@ export function PolicyEditor(props: PolicyEditorProps): JSX.Element {
             // Inherited fields stay draggable: dragging one writes a concrete
             // value and the "inherit" checkbox flips off automatically. A
             // hard `disabled` made the slider look broken ("why won't it move").
-            dimmed={override && config[field.key] === undefined}
+            // Also dim the retention mode that is NOT in effect: retainRatio and
+            // retainTokens are exclusive, and showing both at full strength
+            // hid which one the engine actually uses.
+            dimmed={(override && config[field.key] === undefined)
+              || (field.key === 'retainRatio' && retention.retainTokens !== undefined)
+              || (field.key === 'retainTokens' && retention.retainTokens === undefined)}
             onChange={v => { writeField(field.key, v) }}
             extra={inheritToggle(field.key)}
           />

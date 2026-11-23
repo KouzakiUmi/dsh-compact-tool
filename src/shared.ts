@@ -118,3 +118,34 @@ export interface EffectiveResult {
   /** Global policy resolved WITHOUT the override — the UI's reset target. */
   base: MergedPolicy
 }
+
+/**
+ * Merge one override over the global row with compaction-basic's defaults.
+ * Single math source shared by the host (`effectiveFor`) and the client
+ * (settings-page budget preview), so the two cannot drift. Mirrors
+ * `resolveConfig` + `resolveTargetPolicy`:
+ * - retention: an explicit override mode replaces the global mode as a unit;
+ * - maxTokens: `policy.maxTokens`, else `policy.headroomTokens` ONLY when the
+ *   global row sets no explicit `maxTokens` (resolveConfig back-fills the
+ *   override's maxTokens from its own headroom in that case), else the global
+ *   `maxTokens ?? headroomTokens ?? 65536`.
+ */
+export function mergePolicy(global: CompactConfig, policy: ModelPolicyConfig | null): MergedPolicy {
+  const retention = resolveRetention(global, policy)
+  return {
+    thresholdRatio: policy?.thresholdRatio ?? global.thresholdRatio ?? DEFAULTS.thresholdRatio,
+    headroomTokens: policy?.headroomTokens ?? global.headroomTokens ?? DEFAULTS.headroomTokens,
+    retainRatio: retention.retainRatio ?? DEFAULTS.retainRatio,
+    ...retention,
+    summarizationProvider: policy?.summarizationProvider ?? global.summarizationProvider ?? '',
+    summarizationModel: policy?.summarizationModel ?? global.summarizationModel ?? '',
+    maxTokens:
+      policy?.maxTokens ??
+      (global.maxTokens === undefined ? policy?.headroomTokens : undefined) ??
+      global.maxTokens ??
+      global.headroomTokens ??
+      DEFAULTS.headroomTokens,
+    compactionRetries: policy?.compactionRetries ?? global.compactionRetries ?? DEFAULTS.compactionRetries,
+    maxOverflowRetries: policy?.maxOverflowRetries ?? global.maxOverflowRetries ?? DEFAULTS.maxOverflowRetries,
+  }
+}

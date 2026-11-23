@@ -21,6 +21,7 @@ import {
   COMPACTION_ENTRY_ID,
   COMPACT_TOOL_NS,
   DEFAULTS,
+  mergePolicy,
   resolveRetention,
   type CatalogResult,
   type CompactConfig,
@@ -89,8 +90,21 @@ const POLICY_KEYS = [
 
 const GLOBAL_KEYS = [...POLICY_KEYS, 'modelPolicies', 'auto'] as const
 
+/** Per-provider cap for model discovery in `catalog()`. */
+const LIST_MODELS_TIMEOUT_MS = 10_000
+
 export class CompactToolController extends TypertRemoteService {
   static inject = ['llm', 'configEditor']
+
+  /**
+   * Background serial chain for secondary preset edits. The remote handler
+   * only awaits the read target; the remaining preset entries drain here so
+   * the response is not multiplied by `targets.length`. `configEditor.edit`
+   * already serialises on `hmr.runExclusive`, so this chain only orders our
+   * own background work — overlapping `editCompactions` calls append behind
+   * whatever is in flight.
+   */
+  private pending: Promise<void> | undefined
 
   constructor(ctx: Context) {
     super(ctx, 'compactTool', { namespace: COMPACT_TOOL_NS })
@@ -214,13 +228,15 @@ export class CompactToolController extends TypertRemoteService {
    * detached clones, so mutating them and returning `current` is the whole
    * write. For the legacy row the entry config *is* the compaction config.
    *
-   * The read target is edited first: it feeds `currentConfig()`, so the
-   * remote reply only reports success when the config the UI displays was
-   * actually patched. A failure on a *secondary* target (e.g. an unmounted
-   * or mid-remount preset) is logged and tolerated — propagating it would
-   * return `ok: false` while the visible config already persisted, which is
-   * exactly the "click does nothing but reopen shows it applied" trap.
-   * @returns number of entries edited.
+   * The read target is edited first AND awaited: it feeds `currentConfig()`,
+   * so the remote reply only reports success when the config the UI displays
+   * was actually patched. Secondary targets drain on a background chain —
+   * awaiting all presets is what multiplied one save by `targets.length`.
+   * A failure on a *secondary* target (e.g. an unmounted or mid-remount
+   * preset) is logged and tolerated — propagating it would return
+   * `ok: false` while the visible config already persisted, which is exactly
+   * the "click does nothing but reopen shows it applied" trap.
+   * @returns number of entries edited (the awaited primary edit counts as 1).
    */
   private async editCompactions(
     mutate: (config: CompactConfig) => void,
@@ -246,10 +262,7 @@ export class CompactToolController extends TypertRemoteService {
     const read = targets.find(
       target => target.preset !== undefined && target.preset === defaultId,
     ) ?? targets[0]!
-    const ordered = [read, ...targets.filter(target => target !== read)]
-    let first = true
-    let edited = 0
-    for (const target of ordered) {
+    const editTarget = async (target: Target): Promise<void> => {
       const rows = target.rows
       const change: EntryEdit = rows === undefined
         ? (current) => {
@@ -271,19 +284,40 @@ export class CompactToolController extends TypertRemoteService {
             }
             return current
           }
-      try {
-        await this.editEntry(target.entry, change)
-        edited += 1
-      } catch (error) {
-        if (first) throw error
-        const label = target.preset ?? target.entry.options.id
-        this.ctx.logger.warn(
-          `dsh-compact-tool: skipped preset "${label}" after primary edit succeeded: ${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-      first = false
+      await this.editEntry(target.entry, change)
     }
-    return edited
+    // Await only the read target: `currentConfig()` reads it, so the remote
+    // reply must only land after the config the UI displays was patched.
+    // Remaining presets run on the background chain — awaiting all five
+    // `configEditor.edit` calls is what made one save take several seconds.
+    const started = Date.now()
+    await editTarget(read)
+    this.ctx.logger.info(
+      `dsh-compact-tool: primary edit committed on "${read.preset ?? read.entry.options.id}" in ${Date.now() - started}ms`,
+    )
+    const secondary = targets.filter(target => target !== read)
+    if (secondary.length === 0) return 1
+    const drain = async (): Promise<void> => {
+      for (const target of secondary) {
+        try {
+          const t0 = Date.now()
+          await editTarget(target)
+          this.ctx.logger.info(
+            `dsh-compact-tool: secondary edit committed on "${target.preset ?? target.entry.options.id}" in ${Date.now() - t0}ms`,
+          )
+        } catch (error) {
+          const label = target.preset ?? target.entry.options.id
+          this.ctx.logger.warn(
+            `dsh-compact-tool: skipped preset "${label}" after primary edit succeeded: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+    }
+    // Append behind any previous background drain so secondary edits stay
+    // ordered relative to each other across overlapping writes.
+    this.pending = (this.pending ?? Promise.resolve()).then(drain, drain)
+    this.pending.catch(() => undefined)
+    return 1
   }
 
   private sanitizePolicyPatch(patch: Record<string, unknown>): Record<string, unknown> {
@@ -311,20 +345,35 @@ export class CompactToolController extends TypertRemoteService {
     }
   }
 
-  /** Live provider routes plus each provider's advertised model catalog. */
+  /**
+   * Live provider routes plus each provider's advertised model catalog. A
+   * provider whose `listModels` fails or exceeds `LIST_MODELS_TIMEOUT_MS`
+   * contributes an empty list: one stalled adapter must not keep the whole
+   * catalog pending, because the settings page cannot offer any model (or add
+   * an override) until the catalog resolves.
+   */
   @Remote
   async catalog(): Promise<CatalogResult> {
     const providers = this.llm.listProviders()
     const models: CatalogResult['models'] = {}
     await Promise.all(providers.map(async (provider) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        models[provider.id] = (await this.llm.listModels(provider.id)).map(model => ({
+        const listed = await Promise.race([
+          this.llm.listModels(provider.id),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => { reject(new Error('listModels timed out')) }, LIST_MODELS_TIMEOUT_MS)
+          }),
+        ])
+        models[provider.id] = listed.map(model => ({
           provider: model.provider,
           model: model.id,
           name: model.name,
         }))
       } catch {
         models[provider.id] = []
+      } finally {
+        clearTimeout(timer)
       }
     }))
     return {
@@ -460,31 +509,6 @@ function pickPolicy(config: CompactConfig): PolicyFields {
     if (config[key] !== undefined) out[key] = config[key]
   }
   return out
-}
-
-/** Merge one override over the global row with compaction-basic's defaults. */
-function mergePolicy(
-  global: CompactConfig,
-  policy: ModelPolicyConfig | null,
-): EffectiveResult['merged'] {
-  const retention = resolveRetention(global, policy)
-  return {
-    thresholdRatio: policy?.thresholdRatio ?? global.thresholdRatio ?? DEFAULTS.thresholdRatio,
-    headroomTokens: policy?.headroomTokens ?? global.headroomTokens ?? DEFAULTS.headroomTokens,
-    retainRatio: retention.retainRatio ?? DEFAULTS.retainRatio,
-    ...retention,
-    summarizationProvider:
-      policy?.summarizationProvider ?? global.summarizationProvider ?? '',
-    summarizationModel: policy?.summarizationModel ?? global.summarizationModel ?? '',
-    maxTokens:
-      policy?.maxTokens ??
-      global.maxTokens ??
-      global.headroomTokens ??
-      DEFAULTS.headroomTokens,
-    compactionRetries: policy?.compactionRetries ?? global.compactionRetries ?? DEFAULTS.compactionRetries,
-    maxOverflowRetries:
-      policy?.maxOverflowRetries ?? global.maxOverflowRetries ?? DEFAULTS.maxOverflowRetries,
-  }
 }
 
 /** ConfigEditor validates the preset entry itself. Check its nested policy before it writes. */

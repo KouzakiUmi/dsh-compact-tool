@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" font-family="'Inter','Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC',Arial,sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">Compact Tool for DSH</title>
+  <desc id="d">示意图：上下文窗口条显示系统、工具和消息的用量，琥珀色刻度标出压缩触发点，绿色刻度标出压缩后保留的近期历史；用量到达触发点后，旧消息被摘要替换，窗口条缩短为系统、工具、摘要和保留的近期消息。输入框页脚的环形图显示同一份实时用量。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070b16"/>
+      <stop offset="0.6" stop-color="#0c1430"/>
+      <stop offset="1" stop-color="#08202c"/>
+    </linearGradient>
+    <linearGradient id="accentV" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="titleFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#a9b8d0"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6366f1" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#e0af68" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#e0af68" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="fadeRight" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="1"/>
+    </linearGradient>
+    <mask id="gridMask"><rect width="1280" height="520" fill="url(#fadeRight)"/></mask>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#9fb3ff" stroke-opacity="0.08"/>
+    </pattern>
+    <marker id="arrowDown" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M1 1L9 5L1 9" fill="none" stroke="#e0af68" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="1280" height="520" fill="url(#bg)"/>
+  <rect width="1280" height="520" fill="url(#grid)" mask="url(#gridMask)"/>
+  <circle cx="1010" cy="260" r="330" fill="url(#glowA)"/>
+  <circle cx="1003" cy="221" r="150" fill="url(#glowB)"/>
+  <rect width="10" height="520" fill="url(#accentV)"/>
+
+  <!-- 左侧文案 -->
+  <g>
+    <text x="68" y="150" font-size="15" letter-spacing="3.5" fill="#7dd3fc" font-weight="600">DSH PLUGIN · CONTEXT COMPACTION</text>
+    <text x="66" y="226" font-size="62" font-weight="800" fill="url(#titleFill)" letter-spacing="-1">Compact Tool</text>
+    <text x="68" y="286" font-size="26" fill="#dbe4f2">调整 DSH 的上下文压缩，</text>
+    <text x="68" y="322" font-size="26" fill="#dbe4f2">在输入框里实时看到触发点。</text>
+    <text x="68" y="362" font-size="15" fill="#8da0bb">全局与按模型设置触发、预留和保留；新会话生效。</text>
+    <g font-size="14" fill="#cbd5e1">
+      <rect x="68" y="392" width="124" height="34" rx="17" fill="#ffffff" fill-opacity="0.06" stroke="#475569" stroke-opacity="0.8"/>
+      <text x="130" y="414" text-anchor="middle">全局 + 按模型</text>
+      <rect x="202" y="392" width="108" height="34" rx="17" fill="#ffffff" fill-opacity="0.06" stroke="#475569" stroke-opacity="0.8"/>
+      <text x="256" y="414" text-anchor="middle">实时用量环</text>
+      <rect x="320" y="392" width="96" height="34" rx="17" fill="#ffffff" fill-opacity="0.06" stroke="#475569" stroke-opacity="0.8"/>
+      <text x="368" y="414" text-anchor="middle">预算条</text>
+    </g>
+  </g>
+
+  <!-- 右侧示意图 -->
+  <g>
+    <!-- 输入框页脚的环形用量：琥珀刻度 = 触发点 -->
+    <g transform="translate(678 118)">
+      <circle r="22" fill="none" stroke="#ffffff" stroke-opacity="0.14" stroke-width="6"/>
+      <circle r="22" fill="none" stroke="#73daca" stroke-width="6" stroke-linecap="round" stroke-dasharray="80.2 138.2" transform="rotate(-90)"/>
+      <line x1="0" y1="-29" x2="0" y2="-15" stroke="#e0af68" stroke-width="3" stroke-linecap="round" transform="rotate(227.3)"/>
+    </g>
+    <text x="718" y="120" font-size="26" font-weight="700" fill="#f1f5f9">58%</text>
+    <text x="718" y="142" font-size="12" fill="#8da0bb" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">输入框页脚 · 实时用量</text>
+
+    <!-- 压缩前 -->
+    <text x="652" y="196" font-size="13" fill="#cbd5e1" font-weight="600">压缩前</text>
+    <text x="706" y="196" font-size="12" fill="#8da0bb" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">窗口 200k</text>
+    <rect x="652" y="208" width="556" height="26" rx="7" fill="#ffffff" fill-opacity="0.07"/>
+    <rect x="652" y="208" width="50" height="26" rx="7" fill="#7aa2f7"/>
+    <rect x="702" y="208" width="83.4" height="26" fill="#bb9af7"/>
+    <rect x="785.4" y="208" width="189.1" height="26" fill="#73daca"/>
+    <rect x="1185.2" y="208" width="22.8" height="26" rx="7" fill="#ff9e64" fill-opacity="0.45"/>
+    <!-- 触发点（琥珀）与保留点（绿） -->
+    <rect x="1001.5" y="201" width="3" height="40" rx="1.5" fill="#e0af68"/>
+    <path d="M998 193 L1008 193 L1003 200 Z" fill="#e0af68"/>
+    <text x="1003" y="186" text-anchor="middle" font-size="13" font-weight="600" fill="#e0af68">触发 63%</text>
+    <rect x="735.8" y="212" width="3" height="37" rx="1.5" fill="#9ece6a"/>
+    <path d="M732.3 249 L742.3 249 L737.3 242 Z" fill="#9ece6a"/>
+    <text x="737.3" y="267" text-anchor="middle" font-size="13" font-weight="600" fill="#9ece6a">保留</text>
+    <text x="1105" y="267" text-anchor="middle" font-size="12" fill="#8da0bb">输出预留 + 预留余量</text>
+    <circle cx="1003" cy="221" r="6" fill="none" stroke="#e0af68" stroke-width="1.6">
+      <animate attributeName="r" values="6;18" dur="2.4s" repeatCount="indefinite"/>
+      <animate attributeName="stroke-opacity" values="0.75;0" dur="2.4s" repeatCount="indefinite"/>
+    </circle>
+
+    <!-- 压缩 -->
+    <path d="M1003 280 V334" fill="none" stroke="#e0af68" stroke-width="1.8" stroke-opacity="0.9" stroke-dasharray="5 5" marker-end="url(#arrowDown)"/>
+    <text x="1017" y="311" font-size="12" fill="#e0af68" font-family="'JetBrains Mono','Cascadia Mono',Consolas,monospace">到达触发点 → 压缩</text>
+    <circle r="3.5" fill="#fde68a">
+      <animateMotion dur="2.4s" repeatCount="indefinite" path="M1003 280 V334"/>
+    </circle>
+
+    <!-- 压缩后 -->
+    <text x="652" y="338" font-size="13" fill="#cbd5e1" font-weight="600">压缩后</text>
+    <rect x="652" y="350" width="556" height="26" rx="7" fill="#ffffff" fill-opacity="0.07"/>
+    <rect x="652" y="350" width="50" height="26" rx="7" fill="#7aa2f7"/>
+    <rect x="702" y="350" width="83.4" height="26" fill="#bb9af7"/>
+    <rect x="785.4" y="350" width="22.2" height="26" fill="#7dd3fc"/>
+    <rect x="807.6" y="350" width="85.3" height="26" rx="7" fill="#9ece6a"/>
+
+    <!-- 图例 -->
+    <g font-size="12" fill="#a9b8d0">
+      <rect x="652" y="396" width="9" height="9" rx="2" fill="#7aa2f7"/><text x="667" y="405">系统</text>
+      <rect x="710" y="396" width="9" height="9" rx="2" fill="#bb9af7"/><text x="725" y="405">工具</text>
+      <rect x="768" y="396" width="9" height="9" rx="2" fill="#73daca"/><text x="783" y="405">消息</text>
+      <rect x="826" y="396" width="9" height="9" rx="2" fill="#7dd3fc"/><text x="841" y="405">摘要</text>
+      <rect x="884" y="396" width="9" height="9" rx="2" fill="#9ece6a"/><text x="899" y="405">保留的近期消息</text>
+    </g>
+  </g>
+
+  <text x="68" y="486" font-size="12" fill="#6b7d96">示意图 · 200k 窗口、默认策略 · Host + Web Client bundle</text>
+</svg>

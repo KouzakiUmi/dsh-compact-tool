@@ -34,11 +34,12 @@
  * Props: session standard kit only — the slot declares no owner props.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type Dispatch, type RefObject, type SetStateAction } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type Dispatch, type RefObject, type SetStateAction } from 'react'
 import { createPortal } from 'react-dom'
 import { remoteHandle } from './remote.js'
 import { type DebouncedWriter, type SaveState, type Translator, useConfigDraft, useDebouncedWriter, useRemote, withTimeout } from './hooks.js'
-import { consumeDockPopover, openDialog, useDockPopoverRequest } from './dialog.js'
+import { configRevision, consumeDockPopover, openDialog, useConfigRevision, useDockPopoverRequest } from './dialog.js'
+import { createStore, type SnapshotStore } from './store.js'
 import {
   type ContextPressureView,
   type ModelRoute,
@@ -82,10 +83,28 @@ export interface DockEntryProps {
 /**
  * Host slot fibers can be remounted by config writes; `open` persists in
  * module memory keyed by session so an already-open panel does not flash
- * closed/reopened. The popover's optimistic `policy` is likewise hoisted to
- * this fiber (see below), so a remount only costs one `effectiveFor` call.
+ * closed/reopened. The optimistic `policy` lives in a module store too (below),
+ * so a config-write remount never resets the sliders or the ring/bar indicators.
  */
 const panelOpen = new Map<string, boolean>()
+
+/** Optimistic per-route policy state, persisted across fiber remounts. */
+interface DockPolicyState {
+  routeKey: string | null
+  policy: ModelPolicyConfig | null
+  seeded: boolean
+  /** Last external config revision this copy was seeded against. */
+  revision: number
+}
+const dockPolicyStores = new Map<string, SnapshotStore<DockPolicyState>>()
+function dockPolicyStore(sessionId: string): SnapshotStore<DockPolicyState> {
+  let store = dockPolicyStores.get(sessionId)
+  if (store === undefined) {
+    store = createStore<DockPolicyState>({ routeKey: null, policy: null, seeded: false, revision: configRevision.getSnapshot() })
+    dockPolicyStores.set(sessionId, store)
+  }
+  return store
+}
 
 export function DockEntry(props: DockEntryProps): JSX.Element | null {
   const { useProjection, t, sessionId } = props
@@ -128,20 +147,52 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
   // override seeded yet", distinct from an empty override object.
   const draft = useConfigDraft(null)
   const debounce = useDebouncedWriter(700)
-  const [policy, setPolicy] = useState<ModelPolicyConfig | null>(null)
-  const seededFor = useRef<string | null>(null)
   const routeKey = route === undefined ? null : `${route.provider}/${route.model}`
+  // Optimistic policy lives in a module store keyed by session, NOT in fiber
+  // state, so a config-write remount cannot reset the indicators. The store
+  // carries the active routeKey: a model switch re-seeds, a same-route remount
+  // preserves the optimistic copy.
+  const policyStore = dockPolicyStore(sessionId)
+  const policySnap = useSyncExternalStore(policyStore.subscribe, policyStore.getSnapshot)
+  const policy = policySnap.routeKey === routeKey ? policySnap.policy : null
+  const setPolicy = useCallback((updater: SetStateAction<ModelPolicyConfig | null>): void => {
+    const snap = policyStore.getSnapshot()
+    const prev = snap.routeKey === routeKey ? snap.policy : null
+    const next = typeof updater === 'function' ? updater(prev) : updater
+    policyStore.set({ ...snap, routeKey, policy: next, seeded: true })
+  }, [policyStore, routeKey])
+  // A real route change resets the copy and re-arms seeding; a same-route
+  // remount (config write) leaves the store untouched.
   useEffect(() => {
-    seededFor.current = null
-    setPolicy(null)
-  }, [routeKey])
+    const snap = policyStore.getSnapshot()
+    if (snap.routeKey !== routeKey) policyStore.set({ ...snap, routeKey, policy: null, seeded: false })
+  }, [routeKey, policyStore])
+  // An edit committed from the settings page or the full dialog: re-arm
+  // seeding and refetch so the ring and sliders show it. Tracked in the store
+  // (not a ref) so a dock that was unmounted during the edit still catches up.
+  const revision = useConfigRevision()
+  const reloadEffective = effective.reload
+  useEffect(() => {
+    const snap = policyStore.getSnapshot()
+    if (snap.revision === revision) return
+    policyStore.set({ ...snap, seeded: false, revision })
+    reloadEffective()
+  }, [revision, policyStore, reloadEffective])
+  // Seed the server baseline ONCE per route activation; afterwards the
+  // optimistic copy is authoritative and reload/remount never overwrites it.
   useEffect(() => {
     if (route === undefined || effective.state.status !== 'ready') return
     const value = effective.state.value
-    if (value === null || seededFor.current === routeKey) return
-    seededFor.current = routeKey
-    setPolicy(value.policy)
-  }, [effective.state, route, routeKey])
+    if (value === null) return
+    // `useRemote` clears its value one commit AFTER the route changes, so the
+    // first render on a new route still carries the PREVIOUS route's result.
+    // Seeding from it would adopt the old model's override as this model's
+    // policy and, with `seeded` set, never correct it.
+    if (value.provider !== route.provider || value.model !== route.model) return
+    const snap = policyStore.getSnapshot()
+    if (snap.routeKey !== routeKey || snap.seeded) return
+    policyStore.set({ ...snap, routeKey, policy: value.policy, seeded: true })
+  }, [effective.state, route, routeKey, policyStore])
 
   /**
    * Write one or more override fields in ONE wire call; `null` deletes a key.
@@ -150,8 +201,8 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
    * when ⟲ removes the last field the Host deletes the whole row, so `policy`
    * becomes null. Otherwise the "custom policy" checkbox stays checked on a
    * row that no longer exists and the reset looks like it did nothing.
-   * On failure we reset `seededFor` and reload, letting the server snapshot
-   * become the single source of truth instead of leaving a fake override.
+   * On failure we re-arm seeding (`seeded: false`) and reload, letting the
+   * server snapshot become the source of truth instead of a fake override.
    */
   const applyFields = (patchObj: Record<string, unknown>): void => {
     if (route === undefined) return
@@ -176,12 +227,12 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
           // resurrects optimistically-deleted keys (the reset bounce).
           effective.reload()
         } else {
-          seededFor.current = null
+          policyStore.set({ ...policyStore.getSnapshot(), seeded: false })
           effective.reload()
         }
       } catch (error) {
         draft.mutate(error instanceof Error ? error.message : String(error))
-        seededFor.current = null
+        policyStore.set({ ...policyStore.getSnapshot(), seeded: false })
         effective.reload()
       }
     })

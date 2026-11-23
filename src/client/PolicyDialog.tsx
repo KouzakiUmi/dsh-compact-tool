@@ -9,7 +9,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { remoteHandle } from './remote.js'
 import { type Translator, useConfigDraft, useDebouncedWriter, useRemote, withTimeout } from './hooks.js'
-import { closeDialog, useDialogRequest } from './dialog.js'
+import { bumpConfigRevision, closeDialog, useDialogRequest } from './dialog.js'
 import type { UseProjection } from './sessionKit.js'
 import { BudgetBar, type LiveBreakdown } from './BudgetBar.tsx'
 import { PolicyEditor, ReserveField } from './PolicyEditor.tsx'
@@ -65,6 +65,9 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
   }, [provider, model])
   useEffect(() => {
     if (effective.state.status !== 'ready') return
+    // A route change leaves the previous route's result in `effective.state`
+    // for one commit; seeding from it would adopt another model's override.
+    if (effective.state.value.provider !== provider || effective.state.value.model !== model) return
     const key = `${provider}/${model}`
     if (seededFor.current === key) return
     seededFor.current = key
@@ -108,7 +111,7 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
         draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
         // Keep optimistic policy on success; refresh baseline only. Never merge
         // the server row back (resurrects deleted keys → reset bounce).
-        if (result.ok) effective.reload()
+        if (result.ok) { bumpConfigRevision(); effective.reload() }
         else { seededFor.current = null; effective.reload() }
       } catch (error) {
         draft.mutate(error instanceof Error ? error.message : String(error))
@@ -193,7 +196,7 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
                   try {
                     const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, {}))
                     draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-                    if (result.ok) effective.reload()
+                    if (result.ok) { bumpConfigRevision(); effective.reload() }
                     else { seededFor.current = null; effective.reload() }
                   } catch (error) {
                     draft.mutate(error instanceof Error ? error.message : String(error))
@@ -214,6 +217,7 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
                     if (!result.ok) setPolicy(previous)
                     else {
                       setPolicy(null)
+                      bumpConfigRevision()
                       effective.reload()
                     }
                   } catch (error) {

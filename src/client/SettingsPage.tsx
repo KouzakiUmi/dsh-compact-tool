@@ -1,8 +1,9 @@
 /**
  * The `settings.section` page: global policy editor + budget-bar preview +
  * the list of per-model overrides. Every field write debounces into one
- * `patchGlobal`/`setModelPolicy` wire call per control burst; the returned
- * config re-seeds the draft so the UI mirrors the profile patch.
+ * `patchGlobal`/`setModelPolicy` wire call per control burst. The optimistic
+ * draft is the UI's source of truth; only a failed write re-seeds it from the
+ * server. A successful write bumps the config revision so the dock catches up.
  */
 
 import { useEffect, useMemo, useState } from 'react'
@@ -30,15 +31,15 @@ import { PolicyEditor, ReserveField } from './PolicyEditor.tsx'
 import { BudgetBar } from './BudgetBar.tsx'
 import { parseRoute } from './sessionKit.ts'
 import { summarizationIssue } from './health.js'
+import { bumpConfigRevision } from './dialog.js'
 import type {
   CatalogResult,
   CompactConfig,
   DescribeResult,
-  EffectiveResult,
   ModelInfoResult,
   ModelPolicyConfig,
 } from '../shared.js'
-import { DEFAULTS, resolveRetention, type MergedPolicy } from '../shared.js'
+import { DEFAULTS, mergePolicy, type MergedPolicy } from '../shared.js'
 
 export interface SettingsPageProps {
   close(): void
@@ -74,14 +75,17 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
     return remoteHandle().modelInfo(provider, model)
   }, [previewModel])
 
-  // The budget bar must reflect the previewed route's OVERRIDE too, not just
-  // the global row — otherwise the preview contradicts the dock/dialog meter.
-  const previewEffective = useRemote<EffectiveResult | null>(async () => {
-    if (previewModel === '') return { ok: true, value: null }
+  // The budget bar previews the OPTIMISTIC draft (global + the previewed
+  // route's override), merged with the same single-source math the host's
+  // effectiveFor uses. A server snapshot here lagged behind slider drags and
+  // contradicted the dock/dialog meter, which reads `policy ?? base` live.
+  const barPolicy = useMemo((): MergedPolicy => {
+    const c = draft.config ?? {}
+    if (previewModel === '') return mergePolicy(c, null)
     const { provider, model } = parseRoute(previewModel)
-    return remoteHandle().effectiveFor(provider, model)
-  }, [previewModel])
-  const previewMerged = previewEffective.state.status === 'ready' ? previewEffective.state.value?.merged : undefined
+    const override = (c.modelPolicies ?? []).find(p => p.provider === provider && p.model === model) ?? null
+    return mergePolicy(c, override)
+  }, [draft.config, previewModel])
 
   // Failure rollback: pull fresh server truth into the draft. The optimistic
   // draft is authoritative on success; only a failed write re-seeds it.
@@ -111,7 +115,8 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
       try {
         const result = await withTimeout(remoteHandle().patchGlobal(pending))
         draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-        if (!result.ok) void reseedFromServer()
+        if (result.ok) bumpConfigRevision()
+        else void reseedFromServer()
       } catch (error) {
         draft.mutate(error instanceof Error ? error.message : String(error))
         void reseedFromServer()
@@ -148,7 +153,8 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
       try {
         const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, pending))
         draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-        if (!result.ok) void reseedFromServer()
+        if (result.ok) bumpConfigRevision()
+        else void reseedFromServer()
       } catch (error) {
         draft.mutate(error instanceof Error ? error.message : String(error))
         void reseedFromServer()
@@ -178,7 +184,8 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
       try {
         const result = await withTimeout(remoteHandle().removeModelPolicy(provider, model))
         draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-        if (!result.ok) void reseedFromServer()
+        if (result.ok) bumpConfigRevision()
+        else void reseedFromServer()
       } catch (error) {
         draft.mutate(error instanceof Error ? error.message : String(error))
         void reseedFromServer()
@@ -186,22 +193,7 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
     })
   }
 
-  const mergedGlobal = useMemo((): MergedPolicy => {
-    const c = draft.config ?? {}
-    const headroom = c.headroomTokens ?? DEFAULTS.headroomTokens
-    const retention = resolveRetention(c)
-    return {
-      thresholdRatio: c.thresholdRatio ?? DEFAULTS.thresholdRatio,
-      headroomTokens: headroom,
-      retainRatio: retention.retainRatio ?? DEFAULTS.retainRatio,
-      ...retention,
-      summarizationProvider: c.summarizationProvider ?? '',
-      summarizationModel: c.summarizationModel ?? '',
-      maxTokens: c.maxTokens ?? headroom,
-      compactionRetries: c.compactionRetries ?? DEFAULTS.compactionRetries,
-      maxOverflowRetries: c.maxOverflowRetries ?? DEFAULTS.maxOverflowRetries,
-    }
-  }, [draft.config])
+  const mergedGlobal = useMemo((): MergedPolicy => mergePolicy(draft.config ?? {}, null), [draft.config])
 
   if (describe.state.status === 'loading') return <div style={{ padding: 24 }}>…</div>
   if (describe.state.status === 'error') {
@@ -216,10 +208,9 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
       .map(m => ({ value: `${p.id}/${m.model}`, label: `${p.id}/${m.name}` })))
 
   const previewWindow = preview.state.status === 'ready' ? preview.state.value?.contextWindow : undefined
-  const barPolicy = previewMerged ?? mergedGlobal
 
   return (
-    <div style={{ maxWidth: 860, padding: '8px 4px 40px' }}>
+    <div style={{ maxWidth: '100%', minWidth: 0, padding: '8px 4px 40px' }}>
       <h2 style={{ margin: '4px 0 2px' }}>{t('title')}</h2>
       <p style={{ fontSize: 12, opacity: 0.65, margin: '0 0 4px' }}>{t('page.subtitle')}</p>
       <SaveStatus saving={draft.saving} error={draft.error} savedAt={draft.savedAt} t={t} />
@@ -283,12 +274,25 @@ export function SettingsPage(props: SettingsPageProps): JSX.Element {
           onFields={(p, m, fields) => { applyPolicy(p, m, fields) }}
           onRemove={removePolicy}
           onAdd={(provider, model) => {
+            // Optimistic: mirror the empty {provider, model} row the host
+            // creates, so the list shows it immediately. The success path
+            // never re-seeds the draft (single-source-of-truth), so without
+            // this the new row stayed invisible until a page remount.
+            draft.setConfig(prev => {
+              if (prev === null) return prev
+              const policies = [...(prev.modelPolicies ?? [])]
+              if (!policies.some(p => p.provider === provider && p.model === model)) {
+                policies.push({ provider, model })
+              }
+              return { ...prev, modelPolicies: policies }
+            })
             draft.begin()
             void debounce.enqueue(async () => {
               try {
                 const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, {}))
                 draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-                if (!result.ok) void reseedFromServer()
+                if (result.ok) bumpConfigRevision()
+                else void reseedFromServer()
               } catch (error) {
                 draft.mutate(error instanceof Error ? error.message : String(error))
                 void reseedFromServer()
@@ -333,7 +337,7 @@ function PolicyList(props: {
         return (
           <div key={key} style={{ borderTop: '1px solid rgba(127,127,127,0.15)', padding: '6px 0' }}>
             <div style={row}>
-              <span style={{ flex: 1, fontSize: 12 }}>
+              <span style={{ flex: '1 1 240px', fontSize: 12, overflowWrap: 'anywhere' }}>
                 <strong>{key}</strong>
                 <span style={{ marginLeft: 8, fontSize: 11, opacity: 0.55 }}>
                   {overridden.length === 0 ? t('policies.inherit') : `${t('policies.custom')}: ${overridden.join(', ')}`}

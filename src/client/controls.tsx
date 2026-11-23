@@ -1,18 +1,20 @@
 /** Small uncontrolled-style form controls styled to sit in DSH panels. */
 
-import type { CSSProperties, ReactNode } from 'react'
+import { useState, type CSSProperties, type ReactNode } from 'react'
 import { formatTokens } from './format.js'
 import type { Translator } from './hooks.js'
 
-export const row: CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, margin: '10px 0' }
+// The settings modal column is narrow (~560px) and clips horizontal overflow,
+// so control rows must wrap instead of pushing content under the scrollbar.
+export const row: CSSProperties = { display: 'flex', alignItems: 'center', gap: 10, margin: '10px 0', flexWrap: 'wrap' }
 export const labelCell: CSSProperties = { width: 150, flexShrink: 0, fontSize: 12 }
 export const hintText: CSSProperties = { fontSize: 11, opacity: 0.55, marginLeft: 160, marginTop: -6, marginBottom: 6 }
 export const numInput: CSSProperties = {
-  width: 88, padding: '3px 6px', fontSize: 12, borderRadius: 4,
+  width: 88, flexShrink: 0, padding: '3px 6px', fontSize: 12, borderRadius: 4,
   border: '1px solid rgba(127,127,127,0.35)', background: 'transparent', color: 'inherit',
 }
 export const selectStyle: CSSProperties = {
-  padding: '3px 6px', fontSize: 12, borderRadius: 4, maxWidth: 240,
+  padding: '3px 6px', fontSize: 12, borderRadius: 4, maxWidth: 240, minWidth: 0,
   border: '1px solid rgba(127,127,127,0.35)', background: 'transparent', color: 'inherit',
 }
 export const btn: CSSProperties = {
@@ -48,6 +50,26 @@ export interface SliderFieldProps {
 
 export function SliderField(props: SliderFieldProps): JSX.Element {
   const format = props.format ?? formatTokens
+  // The number box keeps its own text while focused. Clamping each keystroke
+  // made typing impossible: "32768" snapped to the 1024 minimum on its first
+  // digit, "0.85" snapped to 0.4 on its leading zero. In-range values commit
+  // live; out-of-range text is clamped only on blur / Enter.
+  const [text, setText] = useState<string | null>(null)
+  // Token counts and retry counts are integers in the engine's schema
+  // (`resolveConfig` rejects 32768.5). A whole-number `step` marks such a
+  // field; typed fractions are rounded so the written value always validates.
+  const stepSize = props.step ?? 1
+  const integral = stepSize >= 1 && Number.isInteger(stepSize)
+  const normalize = (value: number): number => (integral ? Math.round(value) : value)
+  const commit = (raw: string): void => {
+    if (text === null) return // not edited: blur alone must not write
+    setText(null)
+    if (raw === '') return
+    const next = Number(raw)
+    if (!Number.isFinite(next)) return
+    const clamped = Math.min(props.max, Math.max(props.min, normalize(next)))
+    if (clamped !== props.value) props.onChange(clamped)
+  }
   return (
     <div style={{ opacity: props.disabled === true || props.dimmed === true ? 0.5 : 1 }}>
       <div style={row}>
@@ -68,13 +90,25 @@ export function SliderField(props: SliderFieldProps): JSX.Element {
           min={props.min}
           max={props.max}
           step={props.step ?? 1}
-          value={props.value}
+          value={text ?? props.value}
           disabled={props.disabled}
           onChange={event => {
-            // An empty number input must not be parsed as 0 and clamped to min.
-            if (event.target.value === '') return
-            const next = Number(event.target.value)
-            if (Number.isFinite(next)) props.onChange(Math.min(props.max, Math.max(props.min, next)))
+            const raw = event.target.value
+            setText(raw)
+            // Empty / partial input is not 0; commit only complete in-range values.
+            if (raw === '') return
+            const next = Number(raw)
+            // A fraction typed into an integer field is held as text and
+            // rounded on blur / Enter; committing it live would write an
+            // invalid value that the engine rejects at load.
+            if (Number.isFinite(next) && next >= props.min && next <= props.max && normalize(next) === next) {
+              props.onChange(next)
+            }
+          }}
+          onBlur={event => { commit(event.target.value) }}
+          onKeyDown={event => {
+            if (event.key === 'Enter') commit(event.currentTarget.value)
+            else if (event.key === 'Escape') setText(null)
           }}
         />
         <span style={{ width: 64, fontSize: 11, fontVariantNumeric: 'tabular-nums', opacity: 0.8 }}>

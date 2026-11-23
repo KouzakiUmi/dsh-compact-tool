@@ -1,6 +1,6 @@
 {
   "name": "@mileskent/dsh-compact-tool",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "repository": { "type": "git", "url": "git+https://github.com/KouzakiUmi/dsh-compact-tool.git" },
   "homepage": "https://github.com/KouzakiUmi/dsh-compact-tool#readme",
   "bugs": { "url": "https://github.com/KouzakiUmi/dsh-compact-tool/issues" },

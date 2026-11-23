@@ -14,7 +14,7 @@ import { dirname, resolve } from 'node:path'
 
 const root = dirname(fileURLToPath(import.meta.url))
 const watch = process.argv.includes('--watch')
-const pkgName = 'dsh-compact-tool'
+const pkgName = '@mileskent/dsh-compact-tool'
 
 const shared = {
   absWorkingDir: root,
@@ -80,7 +80,7 @@ async function main() {
   // Sanity: the client bundle must open with the ModuleLoader factory call.
   const { readFile } = await import('node:fs/promises')
   const clientJs = await readFile(resolve(root, 'lib/client.js'), 'utf8')
-  if (!clientJs.startsWith('window.__ModuleLoader__.load({id:\'dsh-compact-tool\'')) {
+  if (!clientJs.startsWith('window.__ModuleLoader__.load({id:\'@mileskent/dsh-compact-tool\'')) {
     throw new Error('client bundle is missing the ModuleLoader factory banner')
   }
   console.log('[build] done → lib/index.js, lib/client.js')

@@ -4,4 +4,4 @@
 # `dsh plugin --profile desktop add link:<repo path>`.
 - insert:
     - id: compact-tool
-      name: 'dsh-compact-tool'
+      name: '@mileskent/dsh-compact-tool'

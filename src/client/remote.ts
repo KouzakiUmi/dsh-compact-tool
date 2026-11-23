@@ -43,7 +43,7 @@ function descriptor(
 }
 
 export const compactToolRemote: TypertRemoteContribution = {
-  package: 'dsh-compact-tool',
+  package: '@mileskent/dsh-compact-tool',
   descriptors: [
     descriptor('describe', []),
     descriptor('catalog', []),

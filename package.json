@@ -1,6 +1,7 @@
 {
-  "name": "dsh-compact-tool",
+  "name": "@mileskent/dsh-compact-tool",
   "version": "0.1.0",
+  "repository": { "type": "git", "url": "git+https://github.com/KouzakiUmi/dsh-compact-tool.git" },
   "description": "Settings UI for the DSH context-compaction plugin: global + per-model threshold sliders, live context-pressure monitor bar, model catalog pickers.",
   "type": "module",
   "main": "lib/index.js",

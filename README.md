@@ -32,6 +32,24 @@ dsh plugin --profile desktop add @mileskent/dsh-compact-tool
 
 改动写入 Profile 的配置补丁，**新会话使用新配置**，已挂载的会话沿用原有配置。
 
+## 功能预览
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/KouzakiUmi/dsh-compact-tool/main/assets/screenshots/context-panel-dark.png">
+  <img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-compact-tool/main/assets/screenshots/context-panel-light.png" width="460" alt="输入框页脚的环形用量图与展开的面板：系统、工具、消息三段用量，琥珀色触发点，绿色保留点，以及触发、预留、保留三个滑块">
+</picture>
+
+输入框页脚的环形用量图展开后的面板，随主题切换。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/KouzakiUmi/dsh-compact-tool/main/assets/screenshots/settings-dark.png">
+  <img src="https://raw.githubusercontent.com/KouzakiUmi/dsh-compact-tool/main/assets/screenshots/settings-light.png" width="700" alt="设置 → 上下文压缩：全局策略、预算条和按模型覆盖">
+</picture>
+
+「设置 → 上下文压缩」：全局策略、预算条和按模型覆盖。
+
+两张图由当前 `src/client` 的真实组件在浏览器里渲染，文字、边框和图表颜色取自 DSH 主题文件，圆角、阴影和字号用组件自带的回退值；数据为示例数据，不是运行中的 DSH 截图。
+
 ## 功能
 
 ### 设置页：设置 → 上下文压缩

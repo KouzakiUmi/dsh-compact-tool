@@ -1,6 +1,7 @@
 /** Remote data hooks + save plumbing shared by the settings page and dialog. */
 
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type SetStateAction } from 'react'
+import { dirtyDepthSnapshot, enqueueWrite, flushWrite, scheduleWrite, scopeDirtySnapshot, subscribeDirty, type WriteHooks } from './writeQueue.js'
 import type { RemoteResult } from './remote-types.js'
 import { remoteHandle } from './remote.js'
 import type { CompactConfig } from '../shared.js'
@@ -43,19 +44,57 @@ export type AsyncState<T> =
   | { status: 'error'; error: RemoteErrorInfo }
   | { status: 'ready'; value: T }
 
+/** Retry delays (ms) for soft-refetch failures: the failure keeps the stale
+ *  value invisible to the user, so a quiet retry is the only convergence path. */
+const SOFT_RETRY_DELAYS = [1500, 3000, 6000]
+
 /** Call a remote method and expose its value through an AsyncState. */
 export function useRemote<T>(call: () => Promise<RemoteResult<T>>, deps: readonly unknown[]): {
   state: AsyncState<T>
   reload(): void
+  /** Identity of the chain whose attempt last CONCLUDED — success, hard
+   *  failure (no stale value), or soft-retry exhaustion. Every chain gets a
+   *  unique increasing number assigned inside the effect, so a consumer that
+   *  captured `chainEpoch` before calling `reload()` can tell apart:
+   *  resolution of the chain it fired (concludedChain > captured), resolution
+   *  of an older chain (concludedChain ≤ captured — must NOT be applied), and
+   *  "nothing concluded yet". Counters alone cannot do this: the resolution
+   *  of the chain that was in flight before the reload moves the same counter
+   *  as the re-fired chain, and retry exhaustion produces no new state object
+   *  at all, so neither identity nor counters are sufficient attribution. */
+  concludedChain: number
+  /** Chain number of the currently RUNNING effect iteration (monotonic,
+   *  increasing by one per effect run). Read it BEFORE calling `reload()`:
+   *  the resolution is attributable to the re-fired chain exactly when
+   *  `concludedChain` grows beyond this captured value. */
+  chainEpoch: number
+  /** Identity of the chain whose attempt last RESOLVED SUCCESSFULLY.
+   *  Distinct from `concludedChain`: hard failures and soft-retry exhaustion
+   *  conclude a chain WITHOUT producing a usable resolution, yet they still
+   *  advance `concludedChain`. A consumer deciding whether `state` carries
+   *  the resolution of ITS re-fired chain must compare `resolvedChain`,
+   *  never `concludedChain` — otherwise a failed chain's conclusion makes
+   *  the consumer accept the stale pre-failure value as the new truth. */
+  resolvedChain: number
 } {
   const [state, setState] = useState<AsyncState<T>>({ status: 'loading' })
   const [seq, setSeq] = useState(0)
+  const chainRef = useRef(0)
+  const [concludedChain, setConcludedChain] = useState(0)
+  const [resolvedChain, setResolvedChain] = useState(0)
   const callRef = useRef(call)
   callRef.current = call
   const prevDeps = useRef<readonly unknown[] | null>(null)
   const hasValue = useRef(false)
   useEffect(() => {
     let live = true
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+    // One chain identity per effect iteration, assigned before any async work
+    // starts. Retry rounds inside one chain keep the identity — the chain
+    // concludes only on success, hard failure, or exhaustion.
+    chainRef.current += 1
+    const chain = chainRef.current
+    const conclude = (): void => { setConcludedChain(n => Math.max(n, chain)) }
     // Stale-while-revalidate: a rerun whose deps did not change (manual
     // `reload`, or a re-resolve after a config write) keeps the last value
     // visible instead of flashing every consumer back through `loading`.
@@ -68,39 +107,79 @@ export function useRemote<T>(call: () => Promise<RemoteResult<T>>, deps: readonl
     // Promise.resolve().then converts a synchronous remoteHandle() throw
     // (remote namespace not mounted yet) into the catchable error branch
     // instead of crashing the effect.
-    void Promise.resolve().then(() => callRef.current())
-      .then((result) => {
-        if (!live) return
-        if (result.ok) {
-          hasValue.current = true
-          setState({ status: 'ready', value: result.value })
-        } else if (!(soft && hasValue.current)) {
-          setState({ status: 'error', error: errorOf(result) ?? { code: 'unknown', message: 'unknown' } })
-        }
-        // Soft-refetch failure keeps the previous value: it is still the
-        // freshest truth we have, and write errors surface via SaveStatus.
-      }, (error: unknown) => {
-        if (!live) return
-        if (!(soft && hasValue.current)) {
-          setState({ status: 'error', error: { code: 'throw', message: error instanceof Error ? error.message : String(error) } })
-        }
-      })
-    return () => { live = false }
+    const attempt = (retriesLeft: number): void => {
+      void Promise.resolve().then(() => callRef.current())
+        .then((result) => {
+          if (!live) return
+          if (result.ok) {
+            hasValue.current = true
+            setState({ status: 'ready', value: result.value })
+            setResolvedChain(n => Math.max(n, chain))
+            conclude()
+          } else if (!(soft && hasValue.current)) {
+            setState({ status: 'error', error: errorOf(result) ?? { code: 'unknown', message: 'unknown' } })
+            conclude()
+          } else {
+            retry(retriesLeft)
+          }
+          // Soft-refetch failure keeps the previous value: it is still the
+          // freshest truth we have, and write errors surface via SaveStatus.
+        }, (error: unknown) => {
+          if (!live) return
+          if (!(soft && hasValue.current)) {
+            setState({ status: 'error', error: { code: 'throw', message: error instanceof Error ? error.message : String(error) } })
+            conclude()
+          } else {
+            retry(retriesLeft)
+          }
+        })
+    }
+    // A failed soft refetch used to leave consumers permanently stale (nothing
+    // re-ran this effect). Retry quietly a few times; success or a hard dep
+    // change ends the sequence. Exhaustion CONCLUDES the chain too, otherwise
+    // a consumer awaiting this resolution waits forever.
+    const retry = (retriesLeft: number): void => {
+      if (!live) return
+      if (retriesLeft <= 0) {
+        conclude()
+        return
+      }
+      retryTimer = setTimeout(() => {
+        retryTimer = null
+        if (live) attempt(retriesLeft - 1)
+      }, SOFT_RETRY_DELAYS[SOFT_RETRY_DELAYS.length - retriesLeft] ?? 6000)
+    }
+    attempt(SOFT_RETRY_DELAYS.length)
+    return () => {
+      live = false
+      if (retryTimer !== null) clearTimeout(retryTimer)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seq, ...deps])
-  return { state, reload: useCallback(() => { setSeq(n => n + 1) }, []) }
+  return {
+    state,
+    reload: useCallback(() => { setSeq(n => n + 1) }, []),
+    concludedChain,
+    resolvedChain,
+    chainEpoch: chainRef.current,
+  }
 }
 
 export interface SaveState {
   saving: boolean
   error: string | null
   savedAt: number | null
+  /** Monotonic optimistic-edit epoch: every `setConfig` (user edit) bumps it.
+   *  Reseeding does NOT — it is server truth, not an edit. Failure paths use
+   *  this to detect edits that happened after a write was sent. */
+  epoch(): number
   /** Mark one wire write as in-flight; pairs with the next `mutate`. */
   begin(): void
   /** Settle one write's status ONLY. The optimistic draft is the source of
    *  truth and is never overwritten by a response snapshot. */
   mutate(err?: string): void
-  /** Replace the draft with server truth (failure rollback / explicit refresh). */
+  /** Replace the draft with server truth (failure rollback / explicit refresh).
+   *  Does not bump the epoch. */
   reseed(config: CompactConfig | null): void
   /** Functional updater so concurrent optimistic edits compose (no stale closure). */
   setConfig: Dispatch<SetStateAction<CompactConfig | null>>
@@ -120,6 +199,14 @@ export function useConfigDraft(initial: CompactConfig | null): SaveState {
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const pending = useRef(0)
   const seeded = useRef(false)
+  const editEpoch = useRef(0)
+  const setConfig = useCallback<Dispatch<SetStateAction<CompactConfig | null>>>((action) => {
+    // Every mutation through this channel is a user edit; bumping the epoch
+    // here keeps failure paths honest even when they capture it before the
+    // React state actually commits.
+    editEpoch.current += 1
+    setConfigState(action)
+  }, [])
   // Seed the draft once, when the first server snapshot arrives. Re-seeding on
   // every `initial` identity change (a `describe` soft reload, a fiber remount)
   // would roll back optimistic edits with a possibly stale server snapshot.
@@ -134,7 +221,8 @@ export function useConfigDraft(initial: CompactConfig | null): SaveState {
     saving,
     error,
     savedAt,
-    setConfig: setConfigState,
+    epoch: useCallback(() => editEpoch.current, []),
+    setConfig,
     begin() {
       pending.current += 1
       setSaving(true)
@@ -157,70 +245,62 @@ export function useConfigDraft(initial: CompactConfig | null): SaveState {
 }
 
 export interface DebouncedWriter {
-  (key: string, patch: Record<string, unknown>, save: (patch: Record<string, unknown>) => Promise<void>): void
-  /** Drop every timer that has not fired yet whose key starts with `prefix`. */
-  cancelByPrefix(prefix: string): void
-  /** Append a task to the same serial chain used by flushed timers. */
-  enqueue(task: () => void | Promise<void>): Promise<void>
+  /** Schedule a debounced field write into the canonical write scope
+   *  (`GLOBAL_SCOPE` or `policyScope(p, m)` from writeQueue.ts). The scope is
+   *  module-wide: every entry point shares one timer, one merge patch and one
+   *  serial chain per target, so wire order always matches user intent.
+   *  `hooks.commit` performs the single merged remote write; `begin`/`settle`
+   *  are per-caller lifecycle hooks that always pair-fire exactly once, even
+   *  when several callers' edits merge into one wire write. */
+  (scope: string, patch: Record<string, unknown>, hooks: WriteHooks): void
+  /** Append a task to the scope's serial chain (create/remove override). */
+  enqueueWrite(scope: string, task: () => void | Promise<void>): Promise<void>
 }
 
 /**
- * Merge pending edits to one policy into a single atomic patch.
+ * Per-fiber facade over the module-level write queue (writeQueue.ts).
  *
- * Switching policies flushes the pending patch so dependent edits to global
- * and model settings reach the host in the order the user made them. Every
- * flushed task and removal uses the same serial chain. `cancelByPrefix` drops
- * an unsent patch that would otherwise recreate the removed model policy.
- *
- * Unmount FLUSHES pending tasks onto the chain instead of dropping them: host
- * config writes remount slot fibers, and a cancelled timer would silently lose
- * the user's optimistic edit. setState inside a flushed task no-ops on the
- * dead fiber; only the wire call matters, and it is idempotent (partial-write
- * upsert).
+ * The queue itself never dies with a fiber: host config writes remount slot
+ * fibers, and the debounce timer must survive so the optimistic edit still
+ * reaches the host. Unmount FLUSHES this fiber's scopes onto the chain instead
+ * of waiting out the debounce window — same end effect as before, without
+ * tying wire timing to fiber lifetime.
  */
 export function useDebouncedWriter(delayMs = 600): DebouncedWriter {
-  const pending = useRef<{
-    key: string
-    timer: ReturnType<typeof setTimeout>
-    patch: Record<string, unknown>
-    task: () => Promise<void>
-  } | null>(null)
-  const chain = useRef<Promise<unknown>>(Promise.resolve())
-  const run = useCallback((task: () => void | Promise<void>): Promise<void> => {
-    // A task owns its own error handling; the catch only keeps the chain alive
-    // after an unexpected throw so later writes are not stuck behind it.
-    const next = chain.current.then(() => Promise.resolve(task())).catch(() => { /* keep chain alive */ })
-    chain.current = next
-    return next as Promise<void>
+  const writtenScopes = useRef<Set<string> | null>(null)
+  const noteScope = useCallback((scope: string): void => {
+    if (writtenScopes.current === null) writtenScopes.current = new Set()
+    writtenScopes.current.add(scope)
   }, [])
-  const takePending = useCallback(() => {
-    const entry = pending.current
-    pending.current = null
-    if (entry !== null) clearTimeout(entry.timer)
-    return entry
+  const write = useCallback((scope: string, patch: Record<string, unknown>, hooks: WriteHooks) => {
+    noteScope(scope)
+    scheduleWrite(scope, patch, hooks, delayMs)
+  }, [delayMs, noteScope])
+  const enqueue = useCallback((scope: string, task: () => void | Promise<void>) => {
+    noteScope(scope)
+    return enqueueWrite(scope, task)
+  }, [noteScope])
+  useEffect(() => () => {
+    // Remount-safe flush: only flush scopes THIS fiber actually wrote; other
+    // entries' pending edits keep their own debounce cadence.
+    for (const scope of writtenScopes.current ?? []) flushWrite(scope)
   }, [])
-  const flush = useCallback(() => {
-    const entry = takePending()
-    if (entry !== null) void run(entry.task)
-  }, [run, takePending])
-  const write = useCallback((key: string, patch: Record<string, unknown>, save: (patch: Record<string, unknown>) => Promise<void>) => {
-    if (pending.current?.key !== key) flush()
-    const existing = takePending()
-    const merged = { ...existing?.patch, ...patch }
-    pending.current = {
-      key,
-      patch: merged,
-      task: () => save(merged),
-      timer: setTimeout(flush, delayMs),
-    }
-  }, [delayMs, flush, takePending])
-  const cancelByPrefix = useCallback((prefix: string) => {
-    if (pending.current?.key.startsWith(prefix)) takePending()
-  }, [takePending])
-  const enqueue = useCallback((task: () => void | Promise<void>) => run(task), [run])
-  useEffect(() => flush, [flush])
   const writer = write as DebouncedWriter
-  writer.cancelByPrefix = cancelByPrefix
-  writer.enqueue = enqueue
+  writer.enqueueWrite = enqueue
   return writer
+}
+
+/**
+ * Re-render signal for write-queue dirtiness transitions. Without a scope the
+ * subscription tracks GLOBAL depth (monolithic drafts like the settings page
+ * must wait for every scope); with one it tracks exactly that scope — an
+ * effect guarding on `scopeDirty(scope)` must NOT depend on other scopes
+ * settling, otherwise a long-lived dirty scope (another entry's timer still
+ * running) stalls this entry's reseed forever.
+ */
+export function useWriteDirtiness(scope?: string): boolean {
+  const snapshot = useCallback(() => (scope === undefined
+    ? dirtyDepthSnapshot() > 0
+    : scopeDirtySnapshot(scope)), [scope])
+  return useSyncExternalStore(subscribeDirty, snapshot)
 }

@@ -8,3 +8,6 @@
 /AGENTS.md
 /AUDIT.md
 /COMPACT-UX.md
+
+# Local install tarballs — never commit
+/*.tgz

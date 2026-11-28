@@ -63,6 +63,13 @@ export function SliderField(props: SliderFieldProps): JSX.Element {
   const normalize = (value: number): number => (integral ? Math.round(value) : value)
   const commit = (raw: string): void => {
     if (text === null) return // not edited: blur alone must not write
+    // A blur/Enter can arrive after the input became disabled — the pending
+    // window lookup resolving into a gate flip, a route switch mid-edit. The
+    // held text predates the gate: it was typed against stale (or static)
+    // bounds and must be discarded, never committed through the disabled
+    // control. (Observed: 20000 typed while the cap was 7168, the lookup
+    // flipped the field disabled, and a synthetic focusout still wrote it.)
+    if (props.disabled === true) { setText(null); return }
     setText(null)
     if (raw === '') return
     const next = Number(raw)

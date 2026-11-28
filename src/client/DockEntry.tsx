@@ -37,8 +37,10 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type Dispatch, type RefObject, type SetStateAction } from 'react'
 import { createPortal } from 'react-dom'
 import { remoteHandle } from './remote.js'
-import { type DebouncedWriter, type SaveState, type Translator, useConfigDraft, useDebouncedWriter, useRemote, withTimeout } from './hooks.js'
-import { configRevision, consumeDockPopover, openDialog, useConfigRevision, useDockPopoverRequest } from './dialog.js'
+import { type DebouncedWriter, type SaveState, type Translator, useConfigDraft, useDebouncedWriter, useRemote, useWriteDirtiness, withTimeout } from './hooks.js'
+import { policyScope, scopeDirty } from './writeQueue.js'
+import { reserveStore } from './preview.js'
+import { bumpConfigRevision, configRevision, consumeDockPopover, openDialog, useConfigRevision, useDockPopoverRequest } from './dialog.js'
 import { createStore, type SnapshotStore } from './store.js'
 import {
   type ContextPressureView,
@@ -46,7 +48,7 @@ import {
   useModelRoute,
   type UseProjection,
 } from './sessionKit.js'
-import { formatTokens, ratioSliderBounds, retainTokens as retainOf, thresholdTokens as thresholdOf } from './format.js'
+import { clearViolatesRuntimeInvariant, formatTokens, ratioSliderBounds, retainTokens as retainOf, thresholdTokens as thresholdOf, tokenSliderBounds } from './format.js'
 import type { LiveBreakdown } from './BudgetBar.tsx'
 import { Check, MiniSlider, SaveStatus } from './controls.tsx'
 import { DEFAULTS, resolveRetention, type MergedPolicy } from '../shared.js'
@@ -93,14 +95,26 @@ interface DockPolicyState {
   routeKey: string | null
   policy: ModelPolicyConfig | null
   seeded: boolean
-  /** Last external config revision this copy was seeded against. */
+  /** Last config revision the optimistic copy converged against. */
   revision: number
+  /**
+   * A post-write refetch is owed: the revision bumped (or a write failed) and
+   * only the RESOLUTION of a fetch started afterwards may overwrite the
+   * optimistic copy. Survives fiber remounts, unlike the fiber-local
+   * "awaiting resolution" tracking, so a remount mid-flight re-fires the
+   * fetch instead of falling back to a stale snapshot.
+   */
+  needFetch: boolean
 }
 const dockPolicyStores = new Map<string, SnapshotStore<DockPolicyState>>()
 function dockPolicyStore(sessionId: string): SnapshotStore<DockPolicyState> {
   let store = dockPolicyStores.get(sessionId)
   if (store === undefined) {
-    store = createStore<DockPolicyState>({ routeKey: null, policy: null, seeded: false, revision: configRevision.getSnapshot() })
+    // needFetch from birth: the FIRST seed also has to go through the
+    // fetch-attribution cycle. Seeding directly from whatever useRemote first
+    // resolves can apply a pre-write snapshot when a write races the initial
+    // fetch — the same class of bug as the reset bounce.
+    store = createStore<DockPolicyState>({ routeKey: null, policy: null, seeded: false, revision: configRevision.getSnapshot(), needFetch: true })
     dockPolicyStores.set(sessionId, store)
   }
   return store
@@ -163,36 +177,143 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
   }, [policyStore, routeKey])
   // A real route change resets the copy and re-arms seeding; a same-route
   // remount (config write) leaves the store untouched.
+  // Failure-backoff state: conclusions that carry no usable resolution
+  // (hard errors, retry exhaustion) must NOT refire immediately — a
+  // persistently failing remote would otherwise become a hot request loop.
+  // The timer only ARMS the next effect run; the unified effect below still
+  // owns every fetch decision.
+  const backoffFailures = useRef(0)
+  const backoffTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [backoffTick, setBackoffTick] = useState(0)
+  useEffect(() => () => {
+    if (backoffTimer.current !== null) clearTimeout(backoffTimer.current)
+  }, [])
   useEffect(() => {
     const snap = policyStore.getSnapshot()
-    if (snap.routeKey !== routeKey) policyStore.set({ ...snap, routeKey, policy: null, seeded: false })
+    // Route change: reset the copy AND owe a fetch — the first resolution on
+    // the new route must pass the attribution gate like any other seed.
+    if (snap.routeKey !== routeKey) {
+      backoffFailures.current = 0
+      if (backoffTimer.current !== null) { clearTimeout(backoffTimer.current); backoffTimer.current = null }
+      policyStore.set({ ...snap, routeKey, policy: null, seeded: false, needFetch: true })
+    }
   }, [routeKey, policyStore])
-  // An edit committed from the settings page or the full dialog: re-arm
-  // seeding and refetch so the ring and sliders show it. Tracked in the store
-  // (not a ref) so a dock that was unmounted during the edit still catches up.
+  // Cross-entry convergence: EVERY successful wire write (including this
+  // dock's own) bumps the config revision. The revision watcher only flags
+  // `needFetch`; the unified seeding effect below owns the fetch/apply
+  // sequence. The core invariant: a revision-triggered reseed may ONLY apply
+  // the resolution of a fetch STARTED after the bump — any earlier snapshot
+  // may predate the write (reset bounce / permanent divergence), and the
+  // dirty-clear moment is exactly when such a stale snapshot is still the
+  // visible state while the fresh fetch is still in flight.
   const revision = useConfigRevision()
+  // Scope-specific dirtiness: the reseed skip must re-run the moment THIS
+  // scope's writes drain — a global subscription stalls whenever some other
+  // scope (another entry's debounce, the settings page) is still dirty.
+  const scopeName = route === undefined ? undefined : policyScope(route.provider, route.model)
+  const anyDirty = useWriteDirtiness(scopeName)
   const reloadEffective = effective.reload
   useEffect(() => {
     const snap = policyStore.getSnapshot()
     if (snap.revision === revision) return
-    policyStore.set({ ...snap, seeded: false, revision })
-    reloadEffective()
-  }, [revision, policyStore, reloadEffective])
-  // Seed the server baseline ONCE per route activation; afterwards the
-  // optimistic copy is authoritative and reload/remount never overwrites it.
+    // Write activity is finite and converges on its own; it must not inherit
+    // the failure backoff, otherwise one broken stretch delays convergence
+    // long after the writes that caused it are done.
+    backoffFailures.current = 0
+    if (backoffTimer.current !== null) { clearTimeout(backoffTimer.current); backoffTimer.current = null }
+    policyStore.set({ ...snap, needFetch: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revision, policyStore])
+  // Fiber-local tracking of the fetch this fiber fired, by CHAIN ATTRIBUTION:
+  // the revision at fire time plus the chain epoch at fire time. A resolution
+  // counts only when (a) the chain that concluded is NEWER than the epoch
+  // captured before `reload()` — resolutions of chains already in flight at
+  // fire time are pre-fire snapshots and must never apply — and (b) the
+  // revision is still the one captured at fire time — no write committed while
+  // the fetch was in flight. A mismatched resolution is discarded and refired,
+  // bounded by write activity itself. `needFetch` stays set in the store until
+  // a resolution is APPLIED, so a remount mid-flight simply refires.
+  const awaitingResolution = useRef(false)
+  const chainAtReload = useRef<number | undefined>(undefined)
+  const revisionAtFetch = useRef<number>(revision)
   useEffect(() => {
-    if (route === undefined || effective.state.status !== 'ready') return
-    const value = effective.state.value
-    if (value === null) return
+    if (route === undefined) return
+    const value = effective.state.status === 'ready' ? effective.state.value : null
     // `useRemote` clears its value one commit AFTER the route changes, so the
     // first render on a new route still carries the PREVIOUS route's result.
     // Seeding from it would adopt the old model's override as this model's
-    // policy and, with `seeded` set, never correct it.
-    if (value.provider !== route.provider || value.model !== route.model) return
+    // policy — the route match is therefore part of the APPLY condition, not
+    // an early return: bookkeeping (resolution conclusions, refires) must run
+    // regardless, or the machine wedges in `awaiting` on a route change.
     const snap = policyStore.getSnapshot()
-    if (snap.routeKey !== routeKey || snap.seeded) return
-    policyStore.set({ ...snap, routeKey, policy: value.policy, seeded: true })
-  }, [effective.state, route, routeKey, policyStore])
+    if (snap.routeKey !== routeKey) return
+    const converged = snap.seeded && snap.revision === revision && !snap.needFetch
+    if (converged) return
+    // Overwriting the optimistic copy is forbidden while the scope is dirty —
+    // dirtiness is observable, so this effect re-runs the moment the last
+    // write drains; and every write eventually bumps or rolls back, so the
+    // skip can never go stale.
+    const scope = policyScope(route.provider, route.model)
+    if (scopeDirty(scope)) return
+    if (awaitingResolution.current) {
+      // The resolution counts as OURS only when a chain newer than the
+      // fire-time epoch concluded. An older chain concluding (the automatic
+      // fetch that was in flight when we reloaded) must not even clear the
+      // awaiting flag — its snapshot predates the reload.
+      const epochAtFire = chainAtReload.current ?? 0
+      if (effective.concludedChain <= epochAtFire) return
+      awaitingResolution.current = false
+      chainAtReload.current = undefined
+      if (effective.resolvedChain > epochAtFire) {
+        // A SUCCESSFUL resolution of the chain we fired. `resolvedChain` —
+        // not `concludedChain` — is the attribution key here: hard failures
+        // and soft-retry exhaustion also advance `concludedChain` while the
+        // visible state keeps the stale pre-write value, and applying that
+        // resurrected exactly the snapshot this machine exists to reject.
+        backoffFailures.current = 0
+        if (revisionAtFetch.current === revision && value !== null
+          && value.provider === route.provider && value.model === route.model) {
+          // Post-bump resolution, no intervening write: the only snapshot this
+          // machine ever applies.
+          policyStore.set({ ...snap, policy: value.policy, seeded: true, revision, needFetch: false })
+          return
+        }
+        // Otherwise the resolution crossed a write commit: discard it and
+        // fall through — write activity is bounded, so an immediate refire
+        // converges and never loops.
+      } else {
+        // The chain CONCLUDED WITHOUT a usable resolution (hard error, or
+        // soft-retry exhaustion). Refiring immediately would hot-loop a
+        // persistently failing remote: the failure is re-observed one commit
+        // later and refires again. Back off exponentially; the timer only
+        // arms the next effect run, this effect stays the sole fetch owner.
+        backoffFailures.current += 1
+        if (backoffTimer.current === null) {
+          const delay = Math.min(30000, 1000 * (2 ** (backoffFailures.current - 1)))
+          backoffTimer.current = setTimeout(() => {
+            backoffTimer.current = null
+            setBackoffTick(n => n + 1)
+          }, delay)
+        }
+        return
+      }
+    }
+    if (!snap.seeded || snap.needFetch) {
+      if (awaitingResolution.current) return
+      // An armed backoff timer owns the next fire: dirty/quiet transitions
+      // re-run this effect during the backoff window, and firing here would
+      // bypass the promised spacing — exactly the hot loop the backoff
+      // exists to prevent. The timer's tick re-runs this effect; nothing is
+      // lost. A revision bump clears the timer before flagging needFetch,
+      // so write activity always refires immediately.
+      if (backoffTimer.current !== null) return
+      chainAtReload.current = effective.chainEpoch
+      revisionAtFetch.current = revision
+      awaitingResolution.current = true
+      reloadEffective()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effective.state, effective.concludedChain, effective.resolvedChain, route, routeKey, policyStore, revision, anyDirty, policySnap.needFetch, policySnap.seeded, backoffTick])
 
   /**
    * Write one or more override fields in ONE wire call; `null` deletes a key.
@@ -216,25 +337,25 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
       const hasFields = Object.keys(next).some(k => k !== 'provider' && k !== 'model')
       return hasFields ? next as unknown as ModelPolicyConfig : null
     })
-    debounce(`${provider}/${model}:`, patchObj, async (pending) => {
-      draft.begin()
-      try {
+    debounce(policyScope(provider, model), patchObj, {
+      // One remote write for the merged patch; `begin`/`settle` pair exactly
+      // once per submitter even when several callers' edits merge into this
+      // single wire write.
+      commit: async (pending) => {
         const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, pending))
-        draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-        if (result.ok) {
-          // Keep the optimistic policy; refresh only the global baseline used
-          // as the display fallback. NEVER merge the server row back — that
-          // resurrects optimistically-deleted keys (the reset bounce).
-          effective.reload()
-        } else {
-          policyStore.set({ ...policyStore.getSnapshot(), seeded: false })
-          effective.reload()
+        if (!result.ok) throw new Error(result.error?.message ?? 'error')
+        // Keep the optimistic policy. NEVER merge the server row back — that
+        // resurrects optimistically-deleted keys (the reset bounce). The bump
+        // refreshes every entry's baseline and reseeds once the scope is quiet.
+        bumpConfigRevision()
+      },
+      begin: () => { draft.begin() },
+      settle: (err) => {
+        draft.mutate(err)
+        if (err !== undefined) {
+          policyStore.set({ ...policyStore.getSnapshot(), seeded: false, needFetch: true })
         }
-      } catch (error) {
-        draft.mutate(error instanceof Error ? error.message : String(error))
-        policyStore.set({ ...policyStore.getSnapshot(), seeded: false })
-        effective.reload()
-      }
+      },
     })
   }
 
@@ -244,12 +365,15 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
   // threshold = floor(min(W*ratio, W - reserve - headroom)). With the default
   // headroom that is ~42% of the window, not 80% — the ratio alone would put
   // the tick (and the amber warning) far past where the engine already fired.
+  // The reserve estimate is shared module-wide (settings page, dialog, dock)
+  // so every entry draws the trigger at the same position.
+  const reserve = useSyncExternalStore(reserveStore().subscribe, reserveStore().getSnapshot)
   const ratio = policy?.thresholdRatio ?? base?.thresholdRatio ?? DEFAULTS.thresholdRatio
   const headroom = policy?.headroomTokens ?? base?.headroomTokens ?? DEFAULTS.headroomTokens
   const w = pressure?.contextWindow
   const percent = route !== undefined && useProjection !== undefined
     ? (w !== undefined && w > 0
-      ? Math.round((thresholdOf(w, ratio, headroom, 8192) / w) * 100)
+      ? Math.round((thresholdOf(w, ratio, headroom, reserve) / w) * 100)
       : Math.round(ratio * 100))
     : undefined
 
@@ -378,7 +502,9 @@ export function DockEntry(props: DockEntryProps): JSX.Element | null {
           draft={draft}
           onField={onField}
           onFields={applyFields}
-          onWritten={effective.reload}
+          onWriteFailed={() => {
+            policyStore.set({ ...policyStore.getSnapshot(), seeded: false, needFetch: true })
+          }}
           onClose={() => { setOpen(false) }}
           writer={debounce}
         />,
@@ -415,9 +541,10 @@ interface DockPopoverProps {
   onFields(patch: Record<string, unknown>): void
   /** Shared debounced writer: removal must cancel/reorder pending field writes. */
   writer: DebouncedWriter
-  /** Called after every wire write resolves so the baseline re-syncs in the
-      background (soft reload keeps the panel stable). */
-  onWritten(): void
+  /** Failure path for checkbox writes: re-arm seeding and refetch so the
+      server truth rolls back the optimistic copy through the dirty-guarded
+      reseed channel instead of a direct overwrite. */
+  onWriteFailed(): void
   onClose(): void
 }
 
@@ -475,16 +602,42 @@ function DockPopover(props: DockPopoverProps): JSX.Element {
   const overridden = (key: NumericKey): boolean =>
     typeof policy?.[key] === 'number'
 
+  // Shared reserve estimate: the settings page and the full dialog adjust it
+  // through the same store, so all three entries draw the trigger at one spot.
+  const reserve = useSyncExternalStore(reserveStore().subscribe, reserveStore().getSnapshot)
   const bounds = ratioSliderBounds(base ?? {}, policy ?? {})
   const retention = resolveRetention(base ?? {}, policy)
+  // Token-domain guardrail for the headroom mini slider, same rule as the
+  // full editors: when the window is known the slider must not offer a
+  // headroom that eats the whole pressure budget (which the engine rejects
+  // at runtime).
+  const headroomCap = contextWindow !== undefined && contextWindow > 0
+    // The resolved retention carries the RATIO-mode budget too — passing 0
+    // here used to cap the headroom slider as if nothing was retained,
+    // offering values that leave fewer trigger tokens than the engine keeps.
+    ? tokenSliderBounds(contextWindow, reserve, shown('thresholdRatio'), shown('headroomTokens'), retention).headroomTokensMax
+    : undefined
 
+  const windowPending = contextWindow === undefined && info.state.status === 'loading'
   const resetMark = (key: NumericKey): JSX.Element | undefined => {
     if (!overridden(key)) return undefined
+    // Resetting a window-dependent override mid-lookup shifts the effective
+    // budget toward values the runtime invariant may reject — same gate as
+    // the sliders and the inherit toggle. Ratio keys keep working: their
+    // bounds never depend on the window.
+    // Two independent gates: the pending gate (window unknown — nothing can
+    // be proven) and the invariant gate (window known — the post-clear
+    // inherited budget is evaluable exactly, and resetting into a violation
+    // the engine rejects at runtime is refused, same as the full editors).
+    const gated = (windowPending && (key === 'retainTokens' || key === 'headroomTokens'))
+      || ((key === 'retainTokens' || key === 'headroomTokens' || key === 'thresholdRatio' || key === 'retainRatio')
+        && clearViolatesRuntimeInvariant(contextWindow, reserve, key, policy ?? {}, base ?? {}))
     return (
       <button
         type="button"
         title={t('mini.reset')}
-        style={{ border: 'none', background: 'transparent', color: '#e0af68', cursor: 'pointer', fontSize: 12, padding: 0 }}
+        style={{ border: 'none', background: 'transparent', color: '#e0af68', cursor: gated ? 'default' : 'pointer', fontSize: 12, padding: 0, opacity: gated ? 0.4 : 1 }}
+        disabled={gated}
         onClick={() => { onField(key, null) }}
       >⟲</button>
     )
@@ -527,11 +680,12 @@ function DockPopover(props: DockPopoverProps): JSX.Element {
   const used = live?.pressureTokens ?? 0
   const projected = live?.projectedTokens ?? used
   const W = contextWindow ?? 0
-  const reserve = 8192
   const triggerTokens = W > 0 && base !== null
     ? thresholdOf(W, shown('thresholdRatio'), shown('headroomTokens'), reserve)
     : 0
-  const triggerPct = base !== null ? Math.round(shown('thresholdRatio') * 100) : 0
+  // Token share of the window, NOT the raw ratio: this number must agree with
+  // the tick position drawn on the bar above and the ring tick on the trigger.
+  const triggerPct = W > 0 ? Math.round((triggerTokens / W) * 100) : 0
   const usedPct = W > 0 ? (Math.min(100, (used / W) * 100)) : 0
   const projPct = W > 0 ? Math.min(100, (projected / W) * 100) : 0
   const triggerX = W > 0 ? Math.min(100, (triggerTokens / W) * 100) : 0
@@ -656,7 +810,12 @@ function DockPopover(props: DockPopoverProps): JSX.Element {
           <MiniSlider
             label={t('mini.headroom')}
             value={shown('headroomTokens')}
-            min={1024} max={262144} step={1024}
+            min={Math.min(1024, Math.max(0, Math.min(262144, headroomCap ?? 262144)))}
+            max={Math.max(0, Math.min(262144, headroomCap ?? 262144))} step={1024}
+            // Same pending-window gate as the full editor: headroom's cap
+            // depends on the window, and anything accepted before it arrives
+            // is already inside the debounced write pipeline.
+            disabled={contextWindow === undefined && info.state.status === 'loading'}
             onChange={v => { onField('headroomTokens', v) }}
             extra={resetMark('headroomTokens')}
           />
@@ -673,43 +832,61 @@ function DockPopover(props: DockPopoverProps): JSX.Element {
 
       <Check
         checked={hasOverride}
+        disabled={hasOverride && windowPending}
         label={t('mini.perModel')}
         onChange={(use) => {
           // Optimistic flip first: a controlled checkbox restores its prop
           // synchronously when onChange does not update state, so without
           // this the tick visibly bounces until the write resolves.
+          const scope = policyScope(provider, model)
           if (use) {
             setPolicy({ provider, model })
+            // Ordering is causal, not destructive: `enqueueWrite` first flushes
+            // any pending debounced write (the older user intent) onto the
+            // chain ahead of this create. Reset-then-recreate therefore lands
+            // as reset → delete-row (no-op) → create-empty-row, converging to
+            // the empty row the user asked for — cancelling the pending write
+            // instead used to silently drop the field reset itself.
             draft.begin()
-            void props.writer.enqueue(async () => {
+            void props.writer.enqueueWrite(scope, async () => {
               try {
                 const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, {}))
                 draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-                if (result.ok) props.onWritten()
-                else setPolicy(null)
+                if (result.ok) bumpConfigRevision()
+                else props.onWriteFailed()
               } catch (error) {
                 draft.mutate(error instanceof Error ? error.message : String(error))
-                setPolicy(null)
+                props.onWriteFailed()
               }
             })
           } else {
-            const previous = policy
+            // Unchecking IS the whole-row removal: it collapses the route to
+            // pure inheritance in one step. Same invariant gate as resetting
+            // fields one by one — with the window known the inherited budget
+            // is exactly evaluable and an engine-rejected collapse is refused
+            // (the inherited values are already broken for every route without
+            // an override; fixing them is what re-enables this uncheck).
+            if (windowPending || clearViolatesRuntimeInvariant(contextWindow, reserve, 'headroomTokens', {}, base ?? {})) return
             setPolicy(null)
-            // A pending field write would upsert the row straight back.
-            props.writer.cancelByPrefix(`${provider}/${model}:`)
+            // The pending field write (if any) flushes onto the chain ahead
+            // of this removal, so the removal lands last and the row stays
+            // gone — causal order matches the order the user acted in.
             draft.begin()
-            void props.writer.enqueue(async () => {
+            // Failure rollback is ALWAYS the reseed channel, never a direct
+            // setPolicy(previous): `previous` may carry fields whose writes
+            // were just cancelled (resurrecting them), and on a mid-delete
+            // model switch the closure's `setPolicy` writes into the store of
+            // the NEW route, corrupting it. Reseeding fetches server truth
+            // through the attribution machine for whatever route is current.
+            void props.writer.enqueueWrite(scope, async () => {
               try {
                 const result = await withTimeout(remoteHandle().removeModelPolicy(provider, model))
                 draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-                if (!result.ok) setPolicy(previous)
-                else {
-                  setPolicy(null)
-                  props.onWritten()
-                }
+                if (!result.ok) props.onWriteFailed()
+                else bumpConfigRevision()
               } catch (error) {
                 draft.mutate(error instanceof Error ? error.message : String(error))
-                setPolicy(previous)
+                props.onWriteFailed()
               }
             })
           }

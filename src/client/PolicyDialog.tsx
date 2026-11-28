@@ -5,13 +5,16 @@
  * the same debounced remote helpers as the settings page.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { remoteHandle } from './remote.js'
-import { type Translator, useConfigDraft, useDebouncedWriter, useRemote, withTimeout } from './hooks.js'
-import { bumpConfigRevision, closeDialog, useDialogRequest } from './dialog.js'
+import { type Translator, useConfigDraft, useDebouncedWriter, useRemote, useWriteDirtiness, withTimeout } from './hooks.js'
+import { policyScope, scopeDirty } from './writeQueue.js'
+import { reserveStore, setReserveTokens } from './preview.js'
+import { bumpConfigRevision, closeDialog, useConfigRevision, useDialogRequest } from './dialog.js'
 import type { UseProjection } from './sessionKit.js'
 import { BudgetBar, type LiveBreakdown } from './BudgetBar.tsx'
+import { clearViolatesRuntimeInvariant } from './format.js'
 import { PolicyEditor, ReserveField } from './PolicyEditor.tsx'
 import { DEFAULTS, resolveRetention, type MergedPolicy } from '../shared.js'
 import { btn, Check, SaveStatus, sectionSub, sectionTitle } from './controls.tsx'
@@ -53,26 +56,118 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
   )
   const draft = useConfigDraft(null)
   const debounce = useDebouncedWriter(700)
-  const [reserve, setReserve] = useState(8192)
+  // Shared reserve estimate — one store across settings page, dialog and dock.
+  const reserve = useSyncExternalStore(reserveStore().subscribe, reserveStore().getSnapshot)
   const [policy, setPolicy] = useState<ModelPolicyConfig | null>(null)
 
   // Seed `policy` from the fetched effective result ONCE per route; after
   // that it is the optimistic local copy (see DockPopover for the same rule).
   const seededFor = useRef<string | null>(null)
+  // Failure-backoff state: conclusions with no usable resolution (hard
+  // errors, retry exhaustion) must not refire immediately — a persistently
+  // failing remote would hot-loop. The timer only arms the next effect run.
+  const backoffFailures = useRef(0)
+  const backoffTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [backoffTick, setBackoffTick] = useState(0)
+  useEffect(() => () => {
+    if (backoffTimer.current !== null) clearTimeout(backoffTimer.current)
+  }, [])
   useEffect(() => {
     seededFor.current = null
+    needFetch.current = true
+    awaitingResolution.current = false
+    chainAtReload.current = undefined
+    backoffFailures.current = 0
+    if (backoffTimer.current !== null) { clearTimeout(backoffTimer.current); backoffTimer.current = null }
     setPolicy(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider, model])
+
+  // Cross-entry convergence, same state machine as the dock: any successful
+  // write bumps the revision (this dialog's own writes included); a revision
+  // reseed may ONLY apply the resolution of a fetch started after the bump,
+  // and never while the write scope is dirty. The dialog is a single overlay
+  // fiber that is not remounted by config writes, so fiber-local refs suffice
+  // where the dock needs its module store.
+  const revision = useConfigRevision()
+  const anyDirty = useWriteDirtiness(policyScope(provider, model))
+  const seenRevision = useRef(revision)
+  // needFetch from birth: the first seed also goes through the attribution
+  // cycle — the initial automatic fetch can race a write committed just before
+  // the dialog opened, and only a post-bump resolution is provably fresh.
+  const needFetch = useRef(true)
+  const awaitingResolution = useRef(false)
+  const chainAtReload = useRef<number | undefined>(undefined)
+  const revisionAtFetch = useRef<number>(revision)
   useEffect(() => {
-    if (effective.state.status !== 'ready') return
-    // A route change leaves the previous route's result in `effective.state`
-    // for one commit; seeding from it would adopt another model's override.
-    if (effective.state.value.provider !== provider || effective.state.value.model !== model) return
+    if (seenRevision.current === revision) return
+    seenRevision.current = revision
+    needFetch.current = true
+    // Write activity is finite and converges on its own; it must not inherit
+    // the failure backoff.
+    backoffFailures.current = 0
+    if (backoffTimer.current !== null) { clearTimeout(backoffTimer.current); backoffTimer.current = null }
+    // No reload here: the unified effect below owns the fetch/apply sequence,
+    // and firing it now would race the dirty window.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revision])
+  useEffect(() => {
     const key = `${provider}/${model}`
-    if (seededFor.current === key) return
-    seededFor.current = key
-    setPolicy(effective.state.value.policy)
-  }, [effective.state, provider, model])
+    if (seededFor.current === key && !needFetch.current) return
+    if (scopeDirty(policyScope(provider, model))) return
+    if (awaitingResolution.current) {
+      // The resolution counts as OURS only when a chain NEWER than the
+      // fire-time epoch concluded (state-identity comparison misses retry
+      // exhaustion and soft reloads entirely). Apply ONLY when the revision
+      // is unchanged since fire time: a resolution that crossed a write
+      // commit predates it and must be discarded and refired.
+      const epochAtFire = chainAtReload.current ?? 0
+      if (effective.concludedChain <= epochAtFire) return
+      awaitingResolution.current = false
+      chainAtReload.current = undefined
+      if (effective.resolvedChain > epochAtFire) {
+        // A SUCCESSFUL resolution of the chain we fired — `resolvedChain`,
+        // not `concludedChain`: failures conclude chains while the visible
+        // state still carries the stale pre-write value, and applying that
+        // resurrects exactly the snapshot this machine exists to reject.
+        backoffFailures.current = 0
+        if (revisionAtFetch.current === revision
+          && effective.state.status === 'ready'
+          && effective.state.value.provider === provider && effective.state.value.model === model) {
+          needFetch.current = false
+          seededFor.current = key
+          setPolicy(effective.state.value.policy)
+          return
+        }
+        // Resolution crossed a write commit: discard and refire immediately —
+        // write activity is bounded, so this never loops.
+      } else {
+        // Concluded WITHOUT a usable resolution (hard error / retry
+        // exhaustion). An immediate refire would hot-loop a persistently
+        // failing remote — back off exponentially instead.
+        backoffFailures.current += 1
+        if (backoffTimer.current === null) {
+          const delay = Math.min(30000, 1000 * (2 ** (backoffFailures.current - 1)))
+          backoffTimer.current = setTimeout(() => {
+            backoffTimer.current = null
+            setBackoffTick(n => n + 1)
+          }, delay)
+        }
+        return
+      }
+    }
+    if (!awaitingResolution.current) {
+      // An armed backoff timer owns the next fire (see DockEntry for the
+      // full rationale): firing on a dirty/quiet transition inside the
+      // backoff window bypasses the promised spacing.
+      if (backoffTimer.current !== null) return
+      chainAtReload.current = effective.chainEpoch
+      revisionAtFetch.current = revision
+      awaitingResolution.current = true
+      effective.reload()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [effective.state, effective.concludedChain, effective.resolvedChain, provider, model, anyDirty, revision, backoffTick])
 
   // Global baseline WITHOUT the override: the reset/inherit target. `merged`
   // still carries this row's overrides, so using it as `base` made "inherit"
@@ -93,6 +188,7 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
 
   const contextWindow = live?.contextWindow
     ?? (info.state.status === 'ready' ? info.state.value?.contextWindow : undefined)
+  const windowPending = contextWindow === undefined && info.state.status === 'loading'
 
   const apply = (patchObj: Record<string, unknown>) => {
     setPolicy(prev => {
@@ -104,20 +200,24 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
       const hasFields = Object.keys(next).some(k => k !== 'provider' && k !== 'model')
       return hasFields ? next as unknown as ModelPolicyConfig : null
     })
-    debounce(`${provider}/${model}:`, patchObj, async (pending) => {
-      draft.begin()
-      try {
+    debounce(policyScope(provider, model), patchObj, {
+      // One remote write for the merged patch; `begin`/`settle` pair exactly
+      // once per submitter even when edits merge into one wire write.
+      commit: async (pending) => {
         const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, pending))
-        draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-        // Keep optimistic policy on success; refresh baseline only. Never merge
-        // the server row back (resurrects deleted keys → reset bounce).
-        if (result.ok) { bumpConfigRevision(); effective.reload() }
-        else { seededFor.current = null; effective.reload() }
-      } catch (error) {
-        draft.mutate(error instanceof Error ? error.message : String(error))
-        seededFor.current = null
-        effective.reload()
-      }
+        if (!result.ok) throw new Error(result.error?.message ?? 'error')
+        // Keep optimistic policy on success; the bump converges every entry.
+        // Never merge the server row back (resurrects deleted keys → reset bounce).
+        bumpConfigRevision()
+      },
+      begin: () => { draft.begin() },
+      settle: (err) => {
+        draft.mutate(err)
+        if (err !== undefined) {
+          seededFor.current = null
+          needFetch.current = true
+        }
+      },
     })
   }
 
@@ -179,50 +279,63 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
           />
         )}
         <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-          <ReserveField value={reserve} t={t} onChange={setReserve} />
+          <ReserveField value={reserve} t={t} onChange={setReserveTokens} />
         </div>
 
         <div style={{ margin: '8px 0' }}>
           <Check
             checked={hasOverride}
+            disabled={hasOverride && windowPending}
             label={hasOverride ? t('policies.custom') : t('dialog.useGlobal')}
             onChange={(use) => {
               // Optimistic flip first (controlled checkboxes restore the prop
               // synchronously otherwise).
+              const scope = policyScope(provider, model)
+              const reseedOnFailure = (): void => {
+                // Failure rollback is ALWAYS the reseed channel: `policy` may
+                // carry fields whose writes were cancelled in the meantime
+                // (resurrecting them on restore) — the attribution machine
+                // fetches server truth through a post-bump resolution instead.
+                seededFor.current = null
+                needFetch.current = true
+              }
               if (use) {
                 setPolicy({ provider, model })
+                // Ordering is causal: `enqueueWrite` flushes any pending
+                // debounced write (the older user intent) onto the chain
+                // ahead of this create, so reset-then-recreate converges to
+                // the empty row instead of silently dropping the reset.
                 draft.begin()
-                void debounce.enqueue(async () => {
+                void debounce.enqueueWrite(scope, async () => {
                   try {
                     const result = await withTimeout(remoteHandle().setModelPolicy(provider, model, {}))
                     draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-                    if (result.ok) { bumpConfigRevision(); effective.reload() }
-                    else { seededFor.current = null; effective.reload() }
+                    if (result.ok) bumpConfigRevision()
+                    else reseedOnFailure()
                   } catch (error) {
                     draft.mutate(error instanceof Error ? error.message : String(error))
-                    seededFor.current = null
-                    effective.reload()
+                    reseedOnFailure()
                   }
                 })
               } else {
-                const previous = policy
+                // Unchecking IS the whole-row removal — same runtime-invariant
+                // gate as the dock and the settings row delete: refuse the
+                // collapse when the known-window inheritance is a budget the
+                // engine rejects at runtime.
+                if (windowPending || clearViolatesRuntimeInvariant(contextWindow, reserve, 'headroomTokens', {}, base ?? {})) return
                 setPolicy(null)
-                // Drop pending field writes that would upsert the row back.
-                debounce.cancelByPrefix(`${provider}/${model}:`)
+                // The pending field write (if any) flushes onto the chain
+                // ahead of this removal, so the removal lands last.
                 draft.begin()
-                void debounce.enqueue(async () => {
+                void debounce.enqueueWrite(scope, async () => {
                   try {
                     const result = await withTimeout(remoteHandle().removeModelPolicy(provider, model))
                     draft.mutate(result.ok ? undefined : (result.error?.message ?? 'error'))
-                    if (!result.ok) setPolicy(previous)
-                    else {
-                      setPolicy(null)
-                      bumpConfigRevision()
-                      effective.reload()
-                    }
+                    if (!result.ok) reseedOnFailure()
+                    else bumpConfigRevision()
                   } catch (error) {
                     draft.mutate(error instanceof Error ? error.message : String(error))
-                    setPolicy(previous)
+                    reseedOnFailure()
                   }
                 })
               }
@@ -245,6 +358,9 @@ export function PolicyDialog(props: PolicyDialogProps): JSX.Element {
             t={t}
             onField={onField}
             onFields={p => { apply(p) }}
+            contextWindow={contextWindow}
+            reserveTokens={reserve}
+            capsPending={windowPending}
           />
         )}
       </div>

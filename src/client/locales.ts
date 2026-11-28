@@ -25,6 +25,8 @@ export const en = {
   'policies.add': 'Add override…',
   'policies.edit': 'Edit',
   'policies.remove': 'Remove',
+  'policies.removeBlocked': 'Removing this override collapses the route to the inherited budget, which the compaction engine rejects at runtime. Fix the inherited values first.',
+  'policies.removePending': 'Checking the context window before removal is allowed.',
   'policies.inherit': 'inherit',
   'policies.custom': 'custom',
 
@@ -119,6 +121,8 @@ export const zh: Record<CompactToolKey, string> = {
   'policies.add': '新增覆盖…',
   'policies.edit': '编辑',
   'policies.remove': '删除',
+  'policies.removeBlocked': '删除该覆盖会让路由回落到继承预算，而压缩引擎在运行时会拒绝该预算。请先修正继承值。',
+  'policies.removePending': '正在确认上下文窗口，稍后即可删除。',
   'policies.inherit': '继承',
   'policies.custom': '自定义',
 
